@@ -1,6 +1,10 @@
-import numpy as np
+import os
+from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Dict, Any, Tuple, Optional, List
+
+import numpy as np
+from PIL import Image
 
 
 # ============================================================
@@ -28,13 +32,110 @@ class QuantParams:
 
 
 # ============================================================
-# Helper functions
+# Supported input files
+# ============================================================
+
+SUPPORTED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".npy"
+}
+
+
+def get_input_files(input_folder: str) -> List[Path]:
+    input_folder = Path(input_folder)
+
+    if not input_folder.exists():
+        raise FileNotFoundError(f"Input folder not found: {input_folder}")
+
+    files = []
+
+    for path in input_folder.rglob("*"):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(path)
+
+    files = sorted(files)
+
+    if len(files) == 0:
+        raise ValueError(f"No supported input files found in: {input_folder}")
+
+    return files
+
+
+# ============================================================
+# Input loading
+# ============================================================
+
+def load_input_file(
+    file_path: Path,
+    image_mode: str = "RGB",
+    resize_hw: Optional[Tuple[int, int]] = None,
+    layout: str = "NHWC",
+    add_batch_dim: bool = True,
+) -> np.ndarray:
+    """
+    Loads one input file.
+
+    image_mode:
+        "RGB" for 3-channel image
+        "L" for grayscale
+
+    resize_hw:
+        None means do not resize.
+        (height, width) means resize image to that size.
+
+    layout:
+        "NHWC" gives shape [1, H, W, C]
+        "NCHW" gives shape [1, C, H, W]
+
+    add_batch_dim:
+        True adds batch dimension.
+    """
+
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".npy":
+        x = np.load(file_path).astype(np.float32)
+
+    else:
+        img = Image.open(file_path).convert(image_mode)
+
+        if resize_hw is not None:
+            height, width = resize_hw
+            img = img.resize((width, height), Image.BILINEAR)
+
+        x = np.asarray(img).astype(np.float32)
+
+        # Normalize image input to [0, 1]
+        x = x / 255.0
+
+        # For grayscale image, PIL gives shape [H, W].
+        # Convert to [H, W, 1].
+        if x.ndim == 2:
+            x = x[..., None]
+
+    layout = layout.upper()
+
+    if layout not in ["NHWC", "NCHW"]:
+        raise ValueError("layout must be either 'NHWC' or 'NCHW'")
+
+    # If input is image-like [H, W, C], convert layout if needed.
+    if x.ndim == 3:
+        if layout == "NCHW":
+            x = np.transpose(x, (2, 0, 1))
+
+    # Add batch dimension.
+    if add_batch_dim and x.ndim in [3, 4]:
+        # If already batched .npy, do not add again.
+        if not (suffix == ".npy" and x.ndim == 4):
+            x = np.expand_dims(x, axis=0)
+
+    return x.astype(np.float32)
+
+
+# ============================================================
+# Quantization range helpers
 # ============================================================
 
 def get_signed_qrange(dtype: str) -> Tuple[int, int, np.dtype]:
-    """
-    Returns qmin, qmax, numpy dtype for signed int8/int16.
-    """
     dtype = dtype.lower()
 
     if dtype == "int8":
@@ -43,48 +144,7 @@ def get_signed_qrange(dtype: str) -> Tuple[int, int, np.dtype]:
     if dtype == "int16":
         return -32768, 32767, np.int16
 
-    raise ValueError("Only 'int8' and 'int16' are supported.")
-
-
-def collect_calibration_values(
-    calibration_data: Union[np.ndarray, Iterable[np.ndarray]],
-    remove_nan_inf: bool = True,
-    max_samples: Optional[int] = None,
-    seed: int = 0,
-) -> np.ndarray:
-    """
-    Converts calibration data into one flat float64 array.
-
-    calibration_data can be:
-    - one numpy array
-    - list/tuple/generator of numpy arrays
-    """
-
-    if isinstance(calibration_data, np.ndarray):
-        x = calibration_data.astype(np.float64, copy=False).reshape(-1)
-    else:
-        arrays = []
-        for item in calibration_data:
-            arr = np.asarray(item, dtype=np.float64).reshape(-1)
-            arrays.append(arr)
-
-        if len(arrays) == 0:
-            raise ValueError("Calibration data is empty.")
-
-        x = np.concatenate(arrays, axis=0)
-
-    if remove_nan_inf:
-        x = x[np.isfinite(x)]
-
-    if x.size == 0:
-        raise ValueError("Calibration data has no valid finite values.")
-
-    if max_samples is not None and x.size > max_samples:
-        rng = np.random.default_rng(seed)
-        indices = rng.choice(x.size, size=max_samples, replace=False)
-        x = x[indices]
-
-    return x
+    raise ValueError("Only int8 and int16 are supported.")
 
 
 def ensure_valid_range(
@@ -93,10 +153,6 @@ def ensure_valid_range(
     include_zero: bool = True,
     eps: float = 1e-12,
 ) -> Tuple[float, float]:
-    """
-    Ensures calibration range is valid.
-    Also optionally includes zero inside the range.
-    """
 
     rmin = float(rmin)
     rmax = float(rmax)
@@ -105,14 +161,74 @@ def ensure_valid_range(
         rmin = min(rmin, 0.0)
         rmax = max(rmax, 0.0)
 
-    if rmax < rmin:
-        raise ValueError(f"Invalid range: rmin={rmin}, rmax={rmax}")
-
     if abs(rmax - rmin) < eps:
         rmin -= eps
         rmax += eps
 
+    if rmax < rmin:
+        raise ValueError(f"Invalid range: rmin={rmin}, rmax={rmax}")
+
     return rmin, rmax
+
+
+# ============================================================
+# Collect values from folder for calibration
+# ============================================================
+
+def collect_values_from_folder(
+    input_folder: str,
+    image_mode: str = "RGB",
+    resize_hw: Optional[Tuple[int, int]] = None,
+    layout: str = "NHWC",
+    max_values: Optional[int] = 2_000_000,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    Loads values from all files in a folder and returns one flat array.
+
+    max_values:
+        Limits how many values are used for calibration.
+        This avoids memory explosion for large folders.
+
+    For accurate minmax, you can set max_values=None.
+    """
+
+    files = get_input_files(input_folder)
+    rng = np.random.default_rng(seed)
+
+    collected = []
+
+    for file_path in files:
+        x = load_input_file(
+            file_path=file_path,
+            image_mode=image_mode,
+            resize_hw=resize_hw,
+            layout=layout,
+            add_batch_dim=True,
+        )
+
+        values = x.reshape(-1)
+        values = values[np.isfinite(values)]
+
+        if values.size == 0:
+            continue
+
+        collected.append(values)
+
+    if len(collected) == 0:
+        raise ValueError("No valid finite calibration values found.")
+
+    all_values = np.concatenate(collected, axis=0).astype(np.float32)
+
+    if max_values is not None and all_values.size > max_values:
+        indices = rng.choice(
+            all_values.size,
+            size=max_values,
+            replace=False,
+        )
+        all_values = all_values[indices]
+
+    return all_values
 
 
 # ============================================================
@@ -120,52 +236,45 @@ def ensure_valid_range(
 # ============================================================
 
 def calibrate_minmax(
-    x: np.ndarray,
+    values: np.ndarray,
     include_zero: bool = True,
 ) -> CalibrationResult:
-    """
-    Uses true minimum and maximum from calibration data.
-    Most accurate range coverage, but sensitive to outliers.
-    """
 
-    rmin = float(np.min(x))
-    rmax = float(np.max(x))
+    observed_min = float(np.min(values))
+    observed_max = float(np.max(values))
 
-    rmin, rmax = ensure_valid_range(rmin, rmax, include_zero)
+    rmin, rmax = ensure_valid_range(
+        observed_min,
+        observed_max,
+        include_zero=include_zero,
+    )
 
     return CalibrationResult(
         method="minmax",
         rmin=rmin,
         rmax=rmax,
         details={
-            "observed_min": float(np.min(x)),
-            "observed_max": float(np.max(x)),
-            "include_zero": include_zero,
+            "observed_min": observed_min,
+            "observed_max": observed_max,
         },
     )
 
 
 def calibrate_percentile(
-    x: np.ndarray,
+    values: np.ndarray,
     lower_percentile: float = 0.1,
     upper_percentile: float = 99.9,
     include_zero: bool = True,
 ) -> CalibrationResult:
-    """
-    Clips extreme outliers using percentiles.
 
-    Example:
-    lower_percentile=0.1, upper_percentile=99.9
-    means keep the central 99.8% of values.
-    """
+    rmin = float(np.percentile(values, lower_percentile))
+    rmax = float(np.percentile(values, upper_percentile))
 
-    if not (0.0 <= lower_percentile < upper_percentile <= 100.0):
-        raise ValueError("Percentiles must satisfy 0 <= lower < upper <= 100")
-
-    rmin = float(np.percentile(x, lower_percentile))
-    rmax = float(np.percentile(x, upper_percentile))
-
-    rmin, rmax = ensure_valid_range(rmin, rmax, include_zero)
+    rmin, rmax = ensure_valid_range(
+        rmin,
+        rmax,
+        include_zero=include_zero,
+    )
 
     return CalibrationResult(
         method="percentile",
@@ -174,27 +283,22 @@ def calibrate_percentile(
         details={
             "lower_percentile": lower_percentile,
             "upper_percentile": upper_percentile,
-            "include_zero": include_zero,
+            "observed_min": float(np.min(values)),
+            "observed_max": float(np.max(values)),
         },
     )
 
 
 def calibrate_histogram_percentile(
-    x: np.ndarray,
+    values: np.ndarray,
     bins: int = 2048,
     lower_percentile: float = 0.1,
     upper_percentile: float = 99.9,
     include_zero: bool = True,
 ) -> CalibrationResult:
-    """
-    Histogram-based percentile calibration.
 
-    This is useful when data is very large and you want a histogram-based
-    approximation instead of directly calculating percentiles.
-    """
-
-    observed_min = float(np.min(x))
-    observed_max = float(np.max(x))
+    observed_min = float(np.min(values))
+    observed_max = float(np.max(values))
 
     observed_min, observed_max = ensure_valid_range(
         observed_min,
@@ -203,13 +307,13 @@ def calibrate_histogram_percentile(
     )
 
     hist, edges = np.histogram(
-        x,
+        values,
         bins=bins,
         range=(observed_min, observed_max),
     )
 
     cdf = np.cumsum(hist).astype(np.float64)
-    cdf /= cdf[-1]
+    cdf = cdf / cdf[-1]
 
     lower_target = lower_percentile / 100.0
     upper_target = upper_percentile / 100.0
@@ -223,7 +327,11 @@ def calibrate_histogram_percentile(
     rmin = float(edges[lower_idx])
     rmax = float(edges[upper_idx + 1])
 
-    rmin, rmax = ensure_valid_range(rmin, rmax, include_zero)
+    rmin, rmax = ensure_valid_range(
+        rmin,
+        rmax,
+        include_zero=include_zero,
+    )
 
     return CalibrationResult(
         method="histogram_percentile",
@@ -233,39 +341,35 @@ def calibrate_histogram_percentile(
             "bins": bins,
             "lower_percentile": lower_percentile,
             "upper_percentile": upper_percentile,
-            "observed_min": observed_min,
-            "observed_max": observed_max,
-            "include_zero": include_zero,
+            "observed_min": float(np.min(values)),
+            "observed_max": float(np.max(values)),
         },
     )
 
 
 def calibrate_mean_std(
-    x: np.ndarray,
+    values: np.ndarray,
     num_std: float = 3.0,
     include_zero: bool = True,
 ) -> CalibrationResult:
-    """
-    Uses mean +/- N standard deviations.
 
-    Useful when the data is roughly Gaussian-like.
-    Not always ideal for image inputs, but useful for activations.
-    """
+    mean = float(np.mean(values))
+    std = float(np.std(values))
 
-    mean = float(np.mean(x))
-    std = float(np.std(x))
+    observed_min = float(np.min(values))
+    observed_max = float(np.max(values))
 
     rmin = mean - num_std * std
     rmax = mean + num_std * std
 
-    observed_min = float(np.min(x))
-    observed_max = float(np.max(x))
-
-    # Do not exceed true observed range.
     rmin = max(rmin, observed_min)
     rmax = min(rmax, observed_max)
 
-    rmin, rmax = ensure_valid_range(rmin, rmax, include_zero)
+    rmin, rmax = ensure_valid_range(
+        rmin,
+        rmax,
+        include_zero=include_zero,
+    )
 
     return CalibrationResult(
         method="mean_std",
@@ -277,46 +381,96 @@ def calibrate_mean_std(
             "num_std": num_std,
             "observed_min": observed_min,
             "observed_max": observed_max,
-            "include_zero": include_zero,
         },
     )
 
 
+def calibrate_folder_range(
+    input_folder: str,
+    method: str = "minmax",
+    image_mode: str = "RGB",
+    resize_hw: Optional[Tuple[int, int]] = None,
+    layout: str = "NHWC",
+    include_zero: bool = True,
+    max_values: Optional[int] = 2_000_000,
+    lower_percentile: float = 0.1,
+    upper_percentile: float = 99.9,
+    bins: int = 2048,
+    num_std: float = 3.0,
+) -> CalibrationResult:
+
+    values = collect_values_from_folder(
+        input_folder=input_folder,
+        image_mode=image_mode,
+        resize_hw=resize_hw,
+        layout=layout,
+        max_values=max_values,
+    )
+
+    method = method.lower()
+
+    print("========== Calibration Input Stats ==========")
+    print(f"Total sampled values : {values.size}")
+    print(f"Observed min         : {float(np.min(values))}")
+    print(f"Observed max         : {float(np.max(values))}")
+    print(f"Values < 0           : {int(np.sum(values < 0.0))}")
+    print(f"Values > 1           : {int(np.sum(values > 1.0))}")
+
+    if method == "minmax":
+        return calibrate_minmax(values, include_zero)
+
+    if method == "percentile":
+        return calibrate_percentile(
+            values,
+            lower_percentile=lower_percentile,
+            upper_percentile=upper_percentile,
+            include_zero=include_zero,
+        )
+
+    if method == "histogram_percentile":
+        return calibrate_histogram_percentile(
+            values,
+            bins=bins,
+            lower_percentile=lower_percentile,
+            upper_percentile=upper_percentile,
+            include_zero=include_zero,
+        )
+
+    if method == "mean_std":
+        return calibrate_mean_std(
+            values,
+            num_std=num_std,
+            include_zero=include_zero,
+        )
+
+    raise ValueError(
+        "Unsupported method. Use: minmax, percentile, histogram_percentile, mean_std"
+    )
+
+
 # ============================================================
-# Quantization simulation used by MSE calibration
+# Asymmetric quantization
 # ============================================================
 
-def calculate_asymmetric_qparams_from_range(
-    rmin: float,
-    rmax: float,
+def calculate_asymmetric_qparams(
+    calibration_result: CalibrationResult,
     dtype: str,
-    calibration_method: str = "manual",
 ) -> QuantParams:
-    """
-    Calculates asymmetric quantization parameters.
-
-    Formula:
-        scale = (rmax - rmin) / (qmax - qmin)
-        zero_point = round(qmin - rmin / scale)
-
-    Quantization:
-        q = round(x / scale + zero_point)
-
-    Dequantization:
-        x_float = scale * (q - zero_point)
-    """
 
     qmin, qmax, _ = get_signed_qrange(dtype)
 
-    rmin, rmax = ensure_valid_range(rmin, rmax, include_zero=True)
+    rmin, rmax = ensure_valid_range(
+        calibration_result.rmin,
+        calibration_result.rmax,
+        include_zero=True,
+    )
 
     scale = (rmax - rmin) / float(qmax - qmin)
 
-    if scale <= 0.0:
+    if scale <= 0:
         raise ValueError("Scale must be positive.")
 
-    zero_point_fp = qmin - (rmin / scale)
-    zero_point = int(np.round(zero_point_fp))
+    zero_point = int(round(qmin - rmin / scale))
     zero_point = int(np.clip(zero_point, qmin, qmax))
 
     return QuantParams(
@@ -325,236 +479,8 @@ def calculate_asymmetric_qparams_from_range(
         qmax=qmax,
         scale=float(scale),
         zero_point=zero_point,
-        rmin=float(rmin),
-        rmax=float(rmax),
-        calibration_method=calibration_method,
-    )
-
-
-def fake_quant_dequant_float(
-    x: np.ndarray,
-    rmin: float,
-    rmax: float,
-    dtype: str,
-) -> np.ndarray:
-    """
-    Simulates quantization + dequantization in float.
-    Used to measure MSE without permanently casting to int8/int16.
-    """
-
-    params = calculate_asymmetric_qparams_from_range(
         rmin=rmin,
         rmax=rmax,
-        dtype=dtype,
-        calibration_method="mse_candidate",
-    )
-
-    q = np.round(x / params.scale + params.zero_point)
-    q = np.clip(q, params.qmin, params.qmax)
-
-    dq = params.scale * (q - params.zero_point)
-    return dq
-
-
-def calibrate_mse(
-    x: np.ndarray,
-    dtype: str,
-    num_candidates: int = 100,
-    include_zero: bool = True,
-    max_samples: Optional[int] = 500_000,
-    seed: int = 0,
-) -> CalibrationResult:
-    """
-    Searches for the clipping range that gives minimum reconstruction MSE
-    after fake quantization.
-
-    This is useful when minmax range is affected by outliers.
-
-    For mostly positive data like normalized images [0, 1], this usually
-    searches rmin=0 and different rmax clipping thresholds.
-    """
-
-    if max_samples is not None and x.size > max_samples:
-        rng = np.random.default_rng(seed)
-        indices = rng.choice(x.size, size=max_samples, replace=False)
-        x_eval = x[indices]
-    else:
-        x_eval = x
-
-    observed_min = float(np.min(x_eval))
-    observed_max = float(np.max(x_eval))
-
-    best_mse = np.inf
-    best_rmin = observed_min
-    best_rmax = observed_max
-
-    # Case 1: mostly non-negative data, common for image input [0, 1]
-    if observed_min >= 0.0:
-        rmin_candidates = [0.0 if include_zero else observed_min]
-
-        # Search high clipping thresholds between 99% and 100%.
-        upper_percentiles = np.linspace(99.0, 100.0, num_candidates)
-
-        for rmin in rmin_candidates:
-            for p_high in upper_percentiles:
-                rmax = float(np.percentile(x_eval, p_high))
-                rmin_v, rmax_v = ensure_valid_range(rmin, rmax, include_zero)
-
-                dq = fake_quant_dequant_float(x_eval, rmin_v, rmax_v, dtype)
-                mse = float(np.mean((x_eval - dq) ** 2))
-
-                if mse < best_mse:
-                    best_mse = mse
-                    best_rmin = rmin_v
-                    best_rmax = rmax_v
-
-    # Case 2: mostly non-positive data
-    elif observed_max <= 0.0:
-        rmax_candidates = [0.0 if include_zero else observed_max]
-
-        lower_percentiles = np.linspace(0.0, 1.0, num_candidates)
-
-        for rmax in rmax_candidates:
-            for p_low in lower_percentiles:
-                rmin = float(np.percentile(x_eval, p_low))
-                rmin_v, rmax_v = ensure_valid_range(rmin, rmax, include_zero)
-
-                dq = fake_quant_dequant_float(x_eval, rmin_v, rmax_v, dtype)
-                mse = float(np.mean((x_eval - dq) ** 2))
-
-                if mse < best_mse:
-                    best_mse = mse
-                    best_rmin = rmin_v
-                    best_rmax = rmax_v
-
-    # Case 3: mixed positive and negative data
-    else:
-        tail_percentiles = np.linspace(0.0, 1.0, num_candidates)
-
-        for p_tail in tail_percentiles:
-            rmin = float(np.percentile(x_eval, p_tail))
-            rmax = float(np.percentile(x_eval, 100.0 - p_tail))
-
-            rmin_v, rmax_v = ensure_valid_range(rmin, rmax, include_zero)
-
-            dq = fake_quant_dequant_float(x_eval, rmin_v, rmax_v, dtype)
-            mse = float(np.mean((x_eval - dq) ** 2))
-
-            if mse < best_mse:
-                best_mse = mse
-                best_rmin = rmin_v
-                best_rmax = rmax_v
-
-    best_rmin, best_rmax = ensure_valid_range(best_rmin, best_rmax, include_zero)
-
-    return CalibrationResult(
-        method="mse",
-        rmin=best_rmin,
-        rmax=best_rmax,
-        details={
-            "dtype": dtype,
-            "best_mse": best_mse,
-            "num_candidates": num_candidates,
-            "observed_min": observed_min,
-            "observed_max": observed_max,
-            "include_zero": include_zero,
-        },
-    )
-
-
-# ============================================================
-# Main calibration dispatcher
-# ============================================================
-
-def calibrate_range(
-    calibration_data: Union[np.ndarray, Iterable[np.ndarray]],
-    method: str = "minmax",
-    dtype: str = "int8",
-    include_zero: bool = True,
-    max_samples: Optional[int] = None,
-    **kwargs,
-) -> CalibrationResult:
-    """
-    Main calibration function.
-
-    Supported methods:
-    - minmax
-    - percentile
-    - histogram_percentile
-    - mean_std
-    - mse
-    """
-
-    x = collect_calibration_values(
-        calibration_data,
-        remove_nan_inf=True,
-        max_samples=max_samples,
-    )
-
-    method = method.lower()
-
-    if method == "minmax":
-        return calibrate_minmax(
-            x,
-            include_zero=include_zero,
-        )
-
-    if method == "percentile":
-        return calibrate_percentile(
-            x,
-            lower_percentile=kwargs.get("lower_percentile", 0.1),
-            upper_percentile=kwargs.get("upper_percentile", 99.9),
-            include_zero=include_zero,
-        )
-
-    if method == "histogram_percentile":
-        return calibrate_histogram_percentile(
-            x,
-            bins=kwargs.get("bins", 2048),
-            lower_percentile=kwargs.get("lower_percentile", 0.1),
-            upper_percentile=kwargs.get("upper_percentile", 99.9),
-            include_zero=include_zero,
-        )
-
-    if method == "mean_std":
-        return calibrate_mean_std(
-            x,
-            num_std=kwargs.get("num_std", 3.0),
-            include_zero=include_zero,
-        )
-
-    if method == "mse":
-        return calibrate_mse(
-            x,
-            dtype=dtype,
-            num_candidates=kwargs.get("num_candidates", 100),
-            include_zero=include_zero,
-            max_samples=kwargs.get("mse_max_samples", 500_000),
-            seed=kwargs.get("seed", 0),
-        )
-
-    raise ValueError(
-        "Unsupported calibration method. Use one of: "
-        "'minmax', 'percentile', 'histogram_percentile', 'mean_std', 'mse'"
-    )
-
-
-# ============================================================
-# Asymmetric quantization / dequantization
-# ============================================================
-
-def calculate_asymmetric_qparams(
-    calibration_result: CalibrationResult,
-    dtype: str,
-) -> QuantParams:
-    """
-    Calculates asymmetric quantization parameters from calibration result.
-    """
-
-    return calculate_asymmetric_qparams_from_range(
-        rmin=calibration_result.rmin,
-        rmax=calibration_result.rmax,
-        dtype=dtype,
         calibration_method=calibration_result.method,
     )
 
@@ -563,68 +489,34 @@ def overflow_report_before_cast(
     x: np.ndarray,
     params: QuantParams,
 ) -> Dict[str, Any]:
-    """
-    Checks overflow before casting to int8/int16.
 
-    Important:
-    Do this before astype(np.int8) or astype(np.int16),
-    because direct casting can wrap values.
-    """
-
-    x_float = np.asarray(x, dtype=np.float64)
-
-    q_raw = np.round(x_float / params.scale + params.zero_point)
+    q_raw = np.round(x.astype(np.float64) / params.scale + params.zero_point)
 
     overflow_low = int(np.sum(q_raw < params.qmin))
     overflow_high = int(np.sum(q_raw > params.qmax))
 
-    total = int(q_raw.size)
-
     return {
-        "dtype": params.dtype,
-        "qmin": params.qmin,
-        "qmax": params.qmax,
-        "scale": params.scale,
-        "zero_point": params.zero_point,
         "raw_q_min": float(np.min(q_raw)),
         "raw_q_max": float(np.max(q_raw)),
         "overflow_low_count": overflow_low,
         "overflow_high_count": overflow_high,
-        "total_values": total,
         "overflow_total": overflow_low + overflow_high,
-        "overflow_percent": 100.0 * (overflow_low + overflow_high) / total,
+        "total_values": int(q_raw.size),
+        "overflow_percent": 100.0 * (overflow_low + overflow_high) / q_raw.size,
     }
 
 
 def quantize_asymmetric(
     x: np.ndarray,
     params: QuantParams,
-    clip: bool = True,
 ) -> np.ndarray:
-    """
-    Quantizes float input to signed int8/int16 using asymmetric quantization.
-
-    Formula:
-        q = round(x / scale + zero_point)
-
-    Important:
-    Always clip before casting.
-    """
 
     _, _, np_dtype = get_signed_qrange(params.dtype)
 
-    x_float = np.asarray(x, dtype=np.float64)
+    q = np.round(x.astype(np.float64) / params.scale + params.zero_point)
 
-    q = np.round(x_float / params.scale + params.zero_point)
-
-    if clip:
-        q = np.clip(q, params.qmin, params.qmax)
-    else:
-        report = overflow_report_before_cast(x, params)
-        if report["overflow_total"] > 0:
-            raise OverflowError(
-                f"Overflow detected before casting: {report}"
-            )
+    # Very important: clip before casting
+    q = np.clip(q, params.qmin, params.qmax)
 
     return q.astype(np_dtype)
 
@@ -633,41 +525,43 @@ def dequantize_asymmetric(
     q: np.ndarray,
     params: QuantParams,
 ) -> np.ndarray:
-    """
-    Dequantizes int8/int16 tensor back to float.
 
-    Formula:
-        x = scale * (q - zero_point)
-    """
-
-    q_float = np.asarray(q, dtype=np.float64)
-    x = params.scale * (q_float - params.zero_point)
-
-    return x.astype(np.float32)
+    return (params.scale * (q.astype(np.float32) - params.zero_point)).astype(np.float32)
 
 
-def quantize_with_calibration(
-    input_data: np.ndarray,
-    calibration_data: Union[np.ndarray, Iterable[np.ndarray]],
-    dtype: str = "int8",
+# ============================================================
+# Quantize full folder
+# ============================================================
+
+def quantize_folder(
+    input_folder: str,
+    output_folder: str,
+    dtype: str = "int16",
     calibration_method: str = "minmax",
-    include_zero: bool = True,
-    **calibration_kwargs,
-) -> Tuple[np.ndarray, QuantParams, CalibrationResult, Dict[str, Any]]:
-    """
-    Full pipeline:
-    1. Calibrate range using calibration data
-    2. Calculate asymmetric qparams
-    3. Check overflow before casting
-    4. Quantize input data
-    """
+    image_mode: str = "RGB",
+    resize_hw: Optional[Tuple[int, int]] = None,
+    layout: str = "NHWC",
+    save_dequant: bool = False,
+) -> QuantParams:
 
-    calibration_result = calibrate_range(
-        calibration_data=calibration_data,
+    input_folder = Path(input_folder)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    files = get_input_files(str(input_folder))
+
+    calibration_result = calibrate_folder_range(
+        input_folder=str(input_folder),
         method=calibration_method,
-        dtype=dtype,
-        include_zero=include_zero,
-        **calibration_kwargs,
+        image_mode=image_mode,
+        resize_hw=resize_hw,
+        layout=layout,
+        include_zero=True,
+        max_values=2_000_000,
+        lower_percentile=0.1,
+        upper_percentile=99.9,
+        bins=2048,
+        num_std=3.0,
     )
 
     params = calculate_asymmetric_qparams(
@@ -675,172 +569,110 @@ def quantize_with_calibration(
         dtype=dtype,
     )
 
-    overflow_report = overflow_report_before_cast(
-        input_data,
-        params,
-    )
-
-    q = quantize_asymmetric(
-        input_data,
-        params,
-        clip=True,
-    )
-
-    return q, params, calibration_result, overflow_report
-
-
-# ============================================================
-# Debug / validation utilities
-# ============================================================
-
-def print_quant_summary(
-    x: np.ndarray,
-    q: np.ndarray,
-    dq: np.ndarray,
-    params: QuantParams,
-    calibration_result: CalibrationResult,
-    overflow_report: Dict[str, Any],
-) -> None:
-    """
-    Prints useful debugging information.
-    """
-
-    abs_error = np.abs(x.astype(np.float32) - dq)
-    mse = float(np.mean((x.astype(np.float32) - dq) ** 2))
-
-    print("\n========== Calibration Summary ==========")
-    print(f"Calibration method : {calibration_result.method}")
-    print(f"Calibration rmin   : {calibration_result.rmin}")
-    print(f"Calibration rmax   : {calibration_result.rmax}")
-    print(f"Details            : {calibration_result.details}")
-
     print("\n========== Quantization Params ==========")
     print(f"dtype       : {params.dtype}")
     print(f"qmin        : {params.qmin}")
     print(f"qmax        : {params.qmax}")
+    print(f"rmin        : {params.rmin}")
+    print(f"rmax        : {params.rmax}")
     print(f"scale       : {params.scale}")
     print(f"zero_point  : {params.zero_point}")
 
-    print("\n========== Input Stats ==========")
-    print(f"input min   : {float(np.min(x))}")
-    print(f"input max   : {float(np.max(x))}")
+    total_overflow = 0
+    total_values = 0
 
-    print("\n========== Raw Quant Overflow Check ==========")
-    for k, v in overflow_report.items():
-        print(f"{k}: {v}")
+    for file_path in files:
+        x = load_input_file(
+            file_path=file_path,
+            image_mode=image_mode,
+            resize_hw=resize_hw,
+            layout=layout,
+            add_batch_dim=True,
+        )
 
-    print("\n========== Quantized Tensor Stats ==========")
-    print(f"q dtype     : {q.dtype}")
-    print(f"q min       : {int(np.min(q))}")
-    print(f"q max       : {int(np.max(q))}")
+        report = overflow_report_before_cast(x, params)
 
-    print("\n========== Dequant Error ==========")
-    print(f"dequant min : {float(np.min(dq))}")
-    print(f"dequant max : {float(np.max(dq))}")
-    print(f"max abs err : {float(np.max(abs_error))}")
-    print(f"mean abs err: {float(np.mean(abs_error))}")
-    print(f"mse         : {mse}")
+        total_overflow += report["overflow_total"]
+        total_values += report["total_values"]
+
+        q = quantize_asymmetric(x, params)
+
+        relative_path = file_path.relative_to(input_folder)
+        output_path = output_folder / relative_path
+        output_path = output_path.with_suffix(f".{dtype}.npy")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        np.save(output_path, q)
+
+        if save_dequant:
+            dq = dequantize_asymmetric(q, params)
+            dq_output_path = output_path.with_suffix(f".{dtype}.dequant.npy")
+            np.save(dq_output_path, dq)
+
+        print(f"Saved: {output_path}")
+        print(f"  input min/max       : {float(np.min(x))}, {float(np.max(x))}")
+        print(f"  raw q min/max       : {report['raw_q_min']}, {report['raw_q_max']}")
+        print(f"  overflow count      : {report['overflow_total']}")
+
+    print("\n========== Folder Overflow Summary ==========")
+    print(f"Total values      : {total_values}")
+    print(f"Total overflow    : {total_overflow}")
+    print(f"Overflow percent  : {100.0 * total_overflow / total_values:.6f}%")
+
+    # Save quant params
+    params_path = output_folder / f"quant_params_{dtype}.txt"
+    with open(params_path, "w") as f:
+        f.write(f"dtype={params.dtype}\n")
+        f.write(f"qmin={params.qmin}\n")
+        f.write(f"qmax={params.qmax}\n")
+        f.write(f"rmin={params.rmin}\n")
+        f.write(f"rmax={params.rmax}\n")
+        f.write(f"scale={params.scale}\n")
+        f.write(f"zero_point={params.zero_point}\n")
+        f.write(f"calibration_method={params.calibration_method}\n")
+
+    print(f"\nSaved quant params: {params_path}")
+
+    return params
 
 
 # ============================================================
-# Example usage
+# Main
 # ============================================================
 
 if __name__ == "__main__":
 
-    # ------------------------------------------------------------
-    # Example calibration data
-    # Replace this with your real calibration images.
-    #
-    # Example shape:
-    # calibration_data = [img1, img2, img3, ...]
-    # Each image can be NHWC or NCHW.
-    # Values are assumed to be normalized between 0 and 1.
-    # ------------------------------------------------------------
+    input_folder = "calibration_inputs"
+    output_folder = "quantized_outputs"
 
-    np.random.seed(0)
-
-    calibration_data = np.random.rand(20, 224, 224, 3).astype(np.float32)
-
-    # Example input to quantize.
-    # Usually this can be one image or a batch.
-    input_data = calibration_data[:1]
-
-    # ------------------------------------------------------------
-    # Choose calibration method
-    # ------------------------------------------------------------
-
-    calibration_method = "minmax"
-    # calibration_method = "percentile"
-    # calibration_method = "histogram_percentile"
-    # calibration_method = "mean_std"
-    # calibration_method = "mse"
-
-    # ------------------------------------------------------------
-    # INT8 asymmetric quantization
-    # ------------------------------------------------------------
-
-    q_int8, params_int8, calib_int8, report_int8 = quantize_with_calibration(
-        input_data=input_data,
-        calibration_data=calibration_data,
-        dtype="int8",
-        calibration_method=calibration_method,
-        include_zero=True,
-
-        # Used only by percentile / histogram_percentile
-        lower_percentile=0.1,
-        upper_percentile=99.9,
-
-        # Used only by histogram_percentile
-        bins=2048,
-
-        # Used only by mean_std
-        num_std=3.0,
-
-        # Used only by mse
-        num_candidates=100,
-        mse_max_samples=500_000,
-    )
-
-    dq_int8 = dequantize_asymmetric(q_int8, params_int8)
-
-    print("\n\n================ INT8 RESULT ================")
-    print_quant_summary(
-        x=input_data,
-        q=q_int8,
-        dq=dq_int8,
-        params=params_int8,
-        calibration_result=calib_int8,
-        overflow_report=report_int8,
-    )
-
-    # ------------------------------------------------------------
-    # INT16 asymmetric quantization
-    # ------------------------------------------------------------
-
-    q_int16, params_int16, calib_int16, report_int16 = quantize_with_calibration(
-        input_data=input_data,
-        calibration_data=calibration_data,
+    # Example 1: INT16 asymmetric quantization
+    params_int16 = quantize_folder(
+        input_folder=input_folder,
+        output_folder=output_folder,
         dtype="int16",
-        calibration_method=calibration_method,
-        include_zero=True,
+        calibration_method="minmax",
 
-        lower_percentile=0.1,
-        upper_percentile=99.9,
-        bins=2048,
-        num_std=3.0,
-        num_candidates=100,
-        mse_max_samples=500_000,
+        # Use this if your model expects RGB input.
+        image_mode="RGB",
+
+        # Set this to your model input size.
+        # Example: resize_hw=(224, 224)
+        resize_hw=None,
+
+        # Use "NHWC" or "NCHW" based on your model.
+        layout="NHWC",
+
+        save_dequant=True,
     )
 
-    dq_int16 = dequantize_asymmetric(q_int16, params_int16)
-
-    print("\n\n================ INT16 RESULT ================")
-    print_quant_summary(
-        x=input_data,
-        q=q_int16,
-        dq=dq_int16,
-        params=params_int16,
-        calibration_result=calib_int16,
-        overflow_report=report_int16,
+    # Example 2: INT8 asymmetric quantization
+    params_int8 = quantize_folder(
+        input_folder=input_folder,
+        output_folder=output_folder,
+        dtype="int8",
+        calibration_method="minmax",
+        image_mode="RGB",
+        resize_hw=None,
+        layout="NHWC",
+        save_dequant=True,
     )
